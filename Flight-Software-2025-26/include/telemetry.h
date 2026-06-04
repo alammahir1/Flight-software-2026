@@ -1,23 +1,18 @@
 /*
  * CanSat 2026 — Team 1079
- * telemetry.cpp  |  Packet transmission and uplink command parsing
+ * telemetry.h  |  Packet transmission and uplink command parsing
  *
- * send_telemetry_packet() — builds the full CSV packet and sends via XBee,
- *   then writes the same line to SD regardless of CX flag.
+ * Telemetry CSV (1 Hz, '\r' terminated) — competition-spec field order:
+ *   TEAM_ID, MISSION_TIME, PACKET_COUNT, MODE, STATE, ALTITUDE, TEMPERATURE,
+ *   PRESSURE, VOLTAGE, CURRENT, GYRO_R, GYRO_P, GYRO_Y, ACCEL_R, ACCEL_P,
+ *   ACCEL_Y, GPS_TIME, GPS_ALTITUDE, GPS_LATITUDE, GPS_LONGITUDE, GPS_SATS,
+ *   CMD_ECHO  [, OPTIONAL_DATA...]
  *
- * parse_commands() — drains XBee RX buffer one line at a time and handles:
- *   CMD,1079,CX,ON|OFF
- *   CMD,1079,ST,hh:mm:ss|GPS
- *   CMD,1079,CAL
- *   CMD,1079,SIM,ENABLE|ACTIVATE|DISABLE
- *   CMD,1079,SIMP,<pressure_Pa>
- *   CMD,1079,MEC,ARM,ON        (custom: DISARMED → ARMED)
- *   CMD,1079,MEC,PAYLOAD,ON
- *   CMD,1079,MEC,PROBE,ON
+ * Time comes from the Teensy 4.1 built-in RTC via TimeLib (synced in main.cpp).
  */
 
 #pragma once
-#include <RV-3028-C7.h> 
+#include <TimeLib.h>          // Teensy built-in RTC (replaces RV-3028)
 
 #include "mission_context.h"
 #include "config.h"
@@ -29,62 +24,69 @@
 #include "mavlink_handler.h"
 
 // ============================================================================
+//  Set the Teensy built-in RTC (and TimeLib software clock) to hh:mm:ss.
+//  Date is fixed to a placeholder — only time-of-day is telemetered.
+// ============================================================================
+static void set_teensy_time(uint8_t hh, uint8_t mm, uint8_t ss) {
+  setTime(hh, mm, ss, 1, 1, 2025);   // h, m, s, day, month, year
+  Teensy3Clock.set(now());           // persist to hardware RTC (needs VBAT cell)
+}
+
+// ============================================================================
 //  send_telemetry_packet
 // ============================================================================
-void send_telemetry_packet(MissionContext& ctx, RV3028& rtc) {
-  // Mission time from RV3028
+void send_telemetry_packet(MissionContext& ctx) {
+  // MISSION_TIME — UTC hh:mm:ss from the Teensy RTC
   char mission_time[12];
   snprintf(mission_time, sizeof(mission_time),
-           "%02d:%02d:%02d", rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+           "%02d:%02d:%02d", hour(), minute(), second());
 
-  // GPS time (populated from MAVLink MSG #33)
+  // GPS_TIME — from MAVLink GPS_RAW_INT (#24)
   char gps_time[12];
   snprintf(gps_time, sizeof(gps_time),
-           "%02d:%02d:%02d",
+           "%02u:%02u:%02u",
            ctx.sd.gps_hour, ctx.sd.gps_min, ctx.sd.gps_sec);
 
-  // ACTIVE_MECHS bitmask
+  // Optional ACTIVE_MECHS bitmask
   uint8_t active_mechs = 0;
   if (ctx.flags & FLAG_PAYLOAD_RELEASED) active_mechs |= 0x01;
   if (ctx.flags & FLAG_PROBE_RELEASED)   active_mechs |= 0x02;
 
   char buf[384];
   snprintf(buf, sizeof(buf),
-    "%s,"          // TEAM_ID
-    "%s,"          // MISSION_TIME
-    "%lu,"         // PACKET_COUNT
-    "%c,"          // MODE  F/S
-    "%s,"          // STATE
-    "%.1f,"        // ALTITUDE  m AGL
-    "%.1f,"        // TEMPERATURE  °C  (LM335AZ)
-    "%.2f,"        // PRESSURE  kPa
-    "%.2f,"        // VOLTAGE  V
-    "%.3f,"        // CURRENT  A
-    "%.2f,%.2f,%.2f,"     // GYRO_R,P,Y  °/s
-    "%.2f,%.2f,%.2f,"     // ACCEL_R,P,Y  raw counts
-    "%s,"          // GPS_TIME
-    "%.1f,"        // GPS_ALTITUDE  m AMSL
-    "%.4f,"        // GPS_LATITUDE
-    "%.4f,"        // GPS_LONGITUDE
-    "%u,"          // GPS_SATS
-    "%s,"          // CMD_ECHO
-    "%s,"          // SUBSTATE  (mirrors STATE until sub-states are added)
-    "%.1f,"        // MAIN_SOC  % (placeholder)
-    "%.2f,"        // BUS_POWER  W
-    "%u,"          // ACTIVE_MECHS  bitmask
-    "%u,"          // ACTIVE_CAMERA  bitmask
-    "%u\r",        // MATEK  1=heartbeat OK
+    // ---- Required spec fields ----
+    "%s,"               // 1  TEAM_ID
+    "%s,"               // 2  MISSION_TIME
+    "%lu,"              // 3  PACKET_COUNT
+    "%c,"               // 4  MODE  F/S
+    "%s,"               // 5  STATE (official)
+    "%.1f,"             // 6  ALTITUDE      m AGL   (0.1 m)
+    "%.1f,"             // 7  TEMPERATURE   °C      (0.1)
+    "%.1f,"             // 8  PRESSURE      kPa     (0.1)
+    "%.1f,"             // 9  VOLTAGE       V       (0.1)
+    "%.2f,"             // 10 CURRENT       A       (0.01)
+    "%.2f,%.2f,%.2f,"   // 11 GYRO_R,P,Y    °/s
+    "%.2f,%.2f,%.2f,"   // 12 ACCEL_R,P,Y
+    "%s,"               // 13 GPS_TIME
+    "%.1f,"             // 14 GPS_ALTITUDE  m AMSL  (0.1 m)
+    "%.4f,"             // 15 GPS_LATITUDE  deg     (0.0001)
+    "%.4f,"             // 16 GPS_LONGITUDE deg     (0.0001)
+    "%u,"               // 17 GPS_SATS      int
+    "%s"                // 18 CMD_ECHO      (no commas)
+    // ---- Optional data (after CMD_ECHO, allowed by spec) ----
+    ",%s,%.1f,%.2f,%u,%u,%u\r",  // SUBSTATE, MAIN_SOC, BUS_POWER,
+                                 // ACTIVE_MECHS, ACTIVE_CAMERA, MATEK
     TEAM_ID_STR,
     mission_time,
     (unsigned long)ctx.packet_count,
     ctx.mode_char(),
-    state_name(ctx.state),
+    telem_state_name(ctx.state),
     ctx.sd.altitude_m,
     ctx.sd.ext_temp_c,
     ctx.sd.pressure_kpa,
     ctx.sd.voltage_v,
     ctx.sd.current_a,
-    ctx.sd.gyro_r, ctx.sd.gyro_p, ctx.sd.gyro_y,
+    ctx.sd.gyro_r,  ctx.sd.gyro_p,  ctx.sd.gyro_y,
     ctx.sd.accel_r, ctx.sd.accel_p, ctx.sd.accel_y,
     gps_time,
     ctx.sd.gps_alt_m,
@@ -92,7 +94,8 @@ void send_telemetry_packet(MissionContext& ctx, RV3028& rtc) {
     ctx.sd.gps_lon,
     ctx.sd.gps_sats,
     ctx.cmd_echo,
-    state_name(ctx.state),
+    // optional
+    state_name(ctx.state),      // SUBSTATE = detailed internal state
     0.0f,                       // MAIN_SOC placeholder
     ctx.sd.bus_power_w,
     active_mechs,
@@ -114,7 +117,7 @@ void send_telemetry_packet(MissionContext& ctx, RV3028& rtc) {
 static char rx_buf[128];
 static int  rx_idx = 0;
 
-void parse_commands(MissionContext& ctx, RV3028& rtc) {
+void parse_commands(MissionContext& ctx) {
   while (XBEE_SERIAL.available()) {
     char c = (char)XBEE_SERIAL.read();
 
@@ -152,13 +155,11 @@ void parse_commands(MissionContext& ctx, RV3028& rtc) {
         char* p = strtok(nullptr, ",");
         if (!p) goto done;
         if (strcmp(p, "GPS") == 0) {
-          rtc.setTime(ctx.sd.gps_sec, ctx.sd.gps_min, ctx.sd.gps_hour,
-                      1, 1, 1, 25);
+          set_teensy_time(ctx.sd.gps_hour, ctx.sd.gps_min, ctx.sd.gps_sec);
         } else {
           int hh = 0, mm = 0, ss = 0;
           if (sscanf(p, "%d:%d:%d", &hh, &mm, &ss) == 3) {
-            rtc.setTime((uint8_t)ss, (uint8_t)mm, (uint8_t)hh,
-                        1, 1, 1, 25);
+            set_teensy_time((uint8_t)hh, (uint8_t)mm, (uint8_t)ss);
           }
         }
         strncpy(ctx.cmd_echo, "ST", 31);
