@@ -9,9 +9,11 @@
  * SD       : Teensy 4.1 SDIO     →  BUILTIN_SDCARD
  *
  * MAVLink messages consumed:
- *   #33  GLOBAL_POSITION_INT  lat/lon (/1e7 → °)  alt (/1000 → m)
+ *   #24  GPS_RAW_INT          satellites_visible, UTC time
  *   #27  RAW_IMU              xacc, yacc, zacc (raw counts)
- *   #30  ATTITUDE             roll/pitch/yaw (rad → ° via × 180/PI)
+ *   #29  SCALED_PRESSURE      press_abs (hPa) — primary altitude source
+ *   #30  ATTITUDE             roll/pitch/yaw (rad → deg)
+ *   #33  GLOBAL_POSITION_INT  lat/lon/alt (telemetry only)
  *
  * Telemetry packet (1 Hz CSV, '\r' terminated):
  *   TEAM_ID, MISSION_TIME, PACKET_COUNT, MODE, STATE,
@@ -20,24 +22,18 @@
  *   GPS_TIME, GPS_ALTITUDE, GPS_LATITUDE, GPS_LONGITUDE, GPS_SATS,
  *   CMD_ECHO, SUBSTATE, MAIN_SOC, BUS_POWER, ACTIVE_MECHS,
  *   ACTIVE_CAMERA, MATEK
- *
- * FSW loop structure (mirrors CDR flowchart):
- *   1. Check for GCS commands (always)
- *   2. If NOT (PRE_LAUNCH or GROUNDED): poll sensors
- *   3. If telemetry active AND timer elapsed: send telemetry
- *   4. State machine logic
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <EEPROM.h>
 #include <RV-3028-C7.h>
- 
-#include "config.h" // compile-time constants
-#include "mission_context.h" // MissionContext struct, MissionState enum, state_name()
-#include "sensing.h" // SensorData struct, sensor_setup(), read_local_sensors()
-#include "flight_logic.h" // launch_detected(), grounded_detected()
-#include "eeprom_store.h" // eeprom_restore(), eeprom_save()
+
+#include "config.h"
+#include "mission_context.h"
+#include "sensing.h"
+#include "flight_logic.h"
+#include "eeprom_store.h"
 #include "servo_control.h"
 #include "telemetry.h"
 #include "sd_card.h"
@@ -50,7 +46,7 @@ RV3028         rtc;
 
 //  Timing
 uint32_t last_telem_ms  = 0;
-uint32_t last_buzzer_ms = 0;
+uint32_t last_sensor_ms = 0;
 uint32_t last_eeprom_ms = 0;
 
 //  Helper: change state, log it, save to EEPROM
@@ -62,22 +58,21 @@ void set_state(MissionState new_state) {
   Serial.println(state_name(new_state));
 }
 
-//  Inline helpers (keep state checks readable in the switch)
-inline bool is_pre_launch() {
-  return ctx.state == MissionState::LAUNCH_PAD_DISARMED ||
-         ctx.state == MissionState::LAUNCH_PAD_ARMED;
-}
-
+// NOTE: is_pre_launch() has been removed. It was only ever used to gate
+// sensor polling, which was the lockout bug. Now that poll_mavlink() runs
+// unconditionally every loop, there is nothing left that needs to test for
+// pre-launch as a combined condition — the state machine handles each state
+// individually. Keeping a dead helper that was the root cause of a critical
+// bug would be confusing.
 
 
 void setup() {
- Serial.begin(115200);   // USB debug — comment out before flight
- delay(400);
- Serial.println(F("[FSW] Booting..."));
+  Serial.begin(115200);
+  delay(400);
+  Serial.println(F("[FSW] Booting..."));
 
   Wire.begin();
 
-  // RV3028
   if (!rtc.begin()) {
     Serial.println(F("[RTC] RV3028 not found — awaiting ST command"));
   } else {
@@ -85,27 +80,20 @@ void setup() {
     Serial.println(F("[RTC] RV3028 OK"));
   }
 
-  // Restore state from EEPROM (handles processor resets)
   eeprom_restore(ctx);
 
-  // Serials
   MAVLINK_SERIAL.begin(MAVLINK_BAUD);
   XBEE_SERIAL.begin(XBEE_BAUD);
 
-  // Sensors
   while (!sensor_setup()) {
     Serial.println(F("[SENSOR] Init failed, retrying..."));
     delay(500);
   }
 
-  // Servos
   payload_release_servo_setup(PIN_SERVO_PAYLOAD);
   egg_release_servo_setup(PIN_SERVO_EGG);
-
-  // Cameras
   camera_setup();
 
-  // SD
   sd_setup();
   sd_write_header(
     "TEAM_ID,MISSION_TIME,PACKET_COUNT,MODE,STATE,"
@@ -120,25 +108,50 @@ void setup() {
 }
 
 void loop() {
-  uint32_t now = millis(); 
+  uint32_t now = millis();
 
-  // 1. GCS commands — checked every iteration 
+  // 1. GCS commands — always
   parse_commands(ctx, rtc);
 
-  // 2. Sensor polling — skipped in PRE_LAUNCH and GROUNDED 
-  if (!is_pre_launch() && ctx.state != MissionState::GROUNDED) {
-    poll_mavlink(ctx);
+  // 2a. MAVLink — drained every loop, in every state.
+  //     This is the only source of accel_y / altitude_m. It is a non-blocking
+  //     UART drain and must never be gated by state — doing so was the lockout
+  //     bug that prevented launch detection on the pad.
+  poll_mavlink(ctx);
+  update_altitude_from_sim(ctx);   // no-op unless SIM mode active
+
+  // 2b. Local sensors: INA260 (I2C) + LM335 (analog) — 10 Hz timer.
+  //     These are blocking calls (~500 µs each on I2C). Scheduling them at
+  //     SENSOR_POLL_MS keeps the loop fast for launch detection while still
+  //     updating power/temperature data fast enough for 1 Hz telemetry.
+  if (now - last_sensor_ms >= SENSOR_POLL_MS) {
+    last_sensor_ms = now;
     read_local_sensors(ctx.sd);
-    update_altitude_from_sim(ctx);
+
+    // Apogee tracking is evaluated here — on the sensor tick — NOT every loop
+    // iteration. Evaluating it every loop caused desc_count to blow past
+    // APOGEE_CONFIRM_COUNT in milliseconds on a single GPS wobble, triggering
+    // false apogee detection. Tying it to the sensor tick means desc_count
+    // increments at most 10 times per second, matching actual sensor cadence.
+    if (ctx.state == MissionState::ASCENT) {
+      if (ctx.sd.altitude_m > ctx.apogee_m) {
+        ctx.apogee_m   = ctx.sd.altitude_m;
+        ctx.desc_count = 0;
+      } else if (ctx.sd.altitude_m < ctx.apogee_m - APOGEE_DESCENT_MARGIN_M) {
+        // Only count descent once we've dropped at least APOGEE_DESCENT_MARGIN_M
+        // below the peak — filters GPS/baro jitter at apogee.
+        ctx.desc_count++;
+      }
+    }
   }
 
-  // 3. Telemetry — 1 Hz 
+  // 3. Telemetry — 1 Hz
   if (now - last_telem_ms >= TELEM_INTERVAL_MS) {
     send_telemetry_packet(ctx, rtc);
     last_telem_ms = now;
   }
 
-  // 4. Periodic EEPROM flush 
+  // 4. Periodic EEPROM flush
   if (now - last_eeprom_ms >= EEPROM_SAVE_MS) {
     eeprom_save(ctx);
     last_eeprom_ms = now;
@@ -153,8 +166,6 @@ void loop() {
 
     case MissionState::LAUNCH_PAD_ARMED:
       if (launch_detected(ctx)) {
-
-        // We have the power for it so we're just gonna keep both cameras on for the whole flight — no need to swap at apogee 
         camera_release_start();
         camera_ground_start();
         set_state(MissionState::ASCENT);
@@ -162,49 +173,33 @@ void loop() {
       break;
 
     case MissionState::ASCENT:
-      // Track apogee
-      if (ctx.sd.altitude_m > ctx.apogee_m) { //check if reached apogee
-        ctx.apogee_m   = ctx.sd.altitude_m;
-        ctx.desc_count = 0;
-        eeprom_save(ctx);
-      } else if (ctx.sd.altitude_m < ctx.apogee_m) { // check if descending after apogee
-        ctx.desc_count++;
-      }
-
-      // Grounded check — covers aborted / very short flights
+      // Apogee tracking runs in the sensor tick above.
       if (grounded_detected(ctx)) {
         set_state(MissionState::GROUNDED);
         break;
       }
-
       if (ctx.desc_count >= APOGEE_CONFIRM_COUNT) {
-        //camera_release_stop();
-        //camera_ground_start();
         set_state(MissionState::APOGEE);
       }
       break;
 
     case MissionState::APOGEE:
-      // One-shot transition — camera swap already done above
       set_state(MissionState::DESCENT_PRE_PAYLOAD_RELEASE);
       break;
 
     case MissionState::DESCENT_PRE_PAYLOAD_RELEASE:
       if (grounded_detected(ctx)) { set_state(MissionState::GROUNDED); break; }
-
-
-      // check if reached payload release altitude (fraction of apogee) — also check apogee > 0 to avoid false trigger on descent from launch pad
       if ((ctx.apogee_m > 0.0f) &&
           (ctx.sd.altitude_m <= PAYLOAD_RELEASE_FRAC * ctx.apogee_m) &&
-          !(ctx.flags & FLAG_PAYLOAD_RELEASED)) { 
+          !(ctx.flags & FLAG_PAYLOAD_RELEASED)) {
         set_state(MissionState::DESCENT_PAYLOAD_RELEASE);
       }
       break;
 
-      case MissionState::DESCENT_PAYLOAD_RELEASE:
-      if (!(ctx.flags & FLAG_PAYLOAD_RELEASED)) { // one-shot payload release actuation
+    case MissionState::DESCENT_PAYLOAD_RELEASE:
+      if (!(ctx.flags & FLAG_PAYLOAD_RELEASED)) {
         payload_release_actuate();
-        ctx.flags |= FLAG_PAYLOAD_RELEASED; // set flag to prevent re-actuation,
+        ctx.flags |= FLAG_PAYLOAD_RELEASED;
         eeprom_save(ctx);
         Serial.println(F("[MECH] Payload released"));
       }
@@ -212,9 +207,7 @@ void loop() {
       break;
 
     case MissionState::DESCENT_PRE_PROBE_RELEASE:
-
       if (grounded_detected(ctx)) { set_state(MissionState::GROUNDED); break; }
-
       if (ctx.sd.altitude_m <= EGG_RELEASE_ALT_M) {
         set_state(MissionState::DESCENT_PROBE_RELEASE);
       }
@@ -237,20 +230,15 @@ void loop() {
       break;
 
     case MissionState::GROUNDED:
-      // No autonomous transitions — listen for commands only
       break;
 
     case MissionState::FAULT:
-      // Keep transmitting for diagnosis, no actuations
       break;
 
-    default: 
-      // Flowchart: CRITICAL ERROR — revert to ASCENT
+    default:
       Serial.println(F("[FSW] CRITICAL ERROR: unknown state — reverting to ASCENT"));
       ctx.desc_count = 0;
       set_state(MissionState::ASCENT);
       break;
   }
 }
-
-
