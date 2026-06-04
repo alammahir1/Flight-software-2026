@@ -3,7 +3,7 @@
  * main.cpp  |  Flight Software  (Teensy 4.1 built-in RTC)
  *
  * MCU      : Teensy 4.1
- * Co-proc  : Matek F405-miniTE  →  Serial1 @ 115200, MAVLink
+ * Co-proc  : Holybro Kakute F405 Wing  →  Serial1 @ 115200, MAVLink
  * RTC      : Teensy 4.1 built-in (TimeLib / Teensy3Clock; VBAT coin cell)
  * Radio    : XBee 3 Pro          →  Serial6 @ 9600
  * SD       : Teensy 4.1 SDIO     →  BUILTIN_SDCARD
@@ -66,10 +66,9 @@ void setup() {
   MAVLINK_SERIAL.begin(MAVLINK_BAUD);
   XBEE_SERIAL.begin(XBEE_BAUD);
 
-  //while (!sensor_setup()) {
-    //Serial.println(F("[SENSOR] Init failed, retrying..."));
-    //delay(500);
-  //}
+  // INA260 init. Non-blocking and fault-tolerant: if the chip is missing or
+  // malfunctioning, power telemetry reads 0 and the loop keeps running.
+  sensor_setup();
 
   payload_release_servo_setup(PIN_SERVO_PAYLOAD);
   egg_release_servo_setup(PIN_SERVO_EGG);
@@ -93,13 +92,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-
-  // ---- PROBE 1: heartbeat ----
-  static uint32_t hb = 0;
-  if (millis() - hb >= 1000) { hb = millis(); Serial.println(F("[HB] loop alive")); }
-
-  
-  // 1. GCS commands — always
+  // 1. GCS commands — XBee uplink + USB Serial for debug
   parse_commands(ctx);
   parse_commands(ctx, Serial);
 
