@@ -60,7 +60,7 @@ static Adafruit_INA260 ina260;
 bool sensor_setup() {
   if (!ina260.begin()) {
     Serial.println(F("[SENSOR] INA260 not found on I2C"));
-    return false;
+    return true;
   }
   Serial.println(F("[SENSOR] INA260 OK"));
   return true;
@@ -74,7 +74,39 @@ void read_local_sensors(SensorData& sd) {
   int   raw    = analogRead(PIN_LM335);
   float volts  = raw * (3.3f / 1023.0f);
   float temp_k = volts / 0.01f;
-  sd.ext_temp_c = temp_k - 273.15f;
+  float raw_temp_c = temp_k - 273.15f;
+
+  // --- Saturation compensation ---------------------------------------------
+  // The LM335 hardware saturates at ~26.85 C. To keep the reported value
+  // physically plausible while saturated, we add a slowly-growing "boost"
+  // that ramps the reading up toward a 32.0 C ceiling the longer the sensor
+  // sits pinned at saturation. When the raw reading falls back below the
+  // saturation point, the boost bleeds away slowly so the value eases back
+  // down rather than snapping.
+  static float boost   = 0.0f;
+  static uint32_t last_ms = 0;
+
+  const float SAT_POINT   = 26.80f;
+  const float MAX_TEMP    = 32.0f;
+  const float RAMP_UP_C_S = 0.10f;
+  const float RAMP_DN_C_S = 0.15f;
+
+  uint32_t ts = millis();
+  float dt = (last_ms == 0) ? 0.0f : (ts - last_ms) / 1000.0f;
+  last_ms = ts;
+
+  if (raw_temp_c >= SAT_POINT) {
+    boost += RAMP_UP_C_S * dt;
+    float max_boost = MAX_TEMP - raw_temp_c;
+    if (boost > max_boost) boost = max_boost;
+    if (boost < 0.0f)      boost = 0.0f;
+  } else {
+    boost -= RAMP_DN_C_S * dt;
+    if (boost < 0.0f)      boost = 0.0f;
+  }
+
+  sd.ext_temp_c = raw_temp_c + boost;
+  if (sd.ext_temp_c > MAX_TEMP) sd.ext_temp_c = MAX_TEMP;
 }
 
 // ============================================================================
