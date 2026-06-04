@@ -11,7 +11,7 @@
  *   CMD,1079,CAL
  *   CMD,1079,SIM,ENABLE|ACTIVATE|DISABLE
  *   CMD,1079,SIMP,<pressure_Pa>
- *   CMD,1079,MEC,ARM,ON        (custom: DISARMED → ARMED)
+ *   CMD,1079,MEC,ARM,ON
  *   CMD,1079,MEC,PAYLOAD,ON
  *   CMD,1079,MEC,PROBE,ON
  */
@@ -32,8 +32,8 @@
 //  set_teensy_time — write HH:MM:SS into the Teensy 4.1 built-in RTC
 // ============================================================================
 void set_teensy_time(uint8_t hh, uint8_t mm, uint8_t ss) {
-  setTime(hh, mm, ss, 1, 1, 2026);   // date fixed; only time-of-day matters
-  Teensy3Clock.set(now());           // persist to the VBAT-backed RTC
+  setTime(hh, mm, ss, 1, 1, 2026);
+  Teensy3Clock.set(now());
 }
 
 // ============================================================================
@@ -56,32 +56,35 @@ void send_telemetry_packet(MissionContext& ctx) {
   if (ctx.flags & FLAG_PAYLOAD_RELEASED) active_mechs |= 0x01;
   if (ctx.flags & FLAG_PROBE_RELEASED)   active_mechs |= 0x02;
 
-  char buf[384];
+  // Guide §3.1.1.1 #19: optional fields must follow TWO commas (blank field).
+  // Format: ...CMD_ECHO,,<optional1>,<optional2>,...
+  char buf[400];
   snprintf(buf, sizeof(buf),
     "%s,"          // TEAM_ID
     "%s,"          // MISSION_TIME
     "%lu,"         // PACKET_COUNT
     "%c,"          // MODE  F/S
-    "%s,"          // STATE
-    "%.1f,"        // ALTITUDE  m AGL
-    "%.1f,"        // TEMPERATURE  °C  (LM335AZ)
-    "%.1f,"        // PRESSURE  kPa
-    "%.1f,"        // VOLTAGE  V
-    "%.2f,"        // CURRENT  A
-    "%.2f,%.2f,%.2f,"     // GYRO_R,P,Y  °/s
-    "%.2f,%.2f,%.2f,"     // ACCEL_R,P,Y  m/s²
+    "%s,"          // STATE  (7 official strings via telem_state_name)
+    "%.1f,"        // ALTITUDE  m AGL,  res 0.1 m
+    "%.1f,"        // TEMPERATURE  °C,  res 0.1 °C
+    "%.1f,"        // PRESSURE  kPa,    res 0.1 kPa
+    "%.1f,"        // VOLTAGE  V,       res 0.1 V
+    "%.2f,"        // CURRENT  A,       res 0.01 A
+    "%.2f,%.2f,%.2f,"    // GYRO_R,P,Y  deg/s
+    "%.2f,%.2f,%.2f,"    // ACCEL_R,P,Y  m/s²
     "%s,"          // GPS_TIME
-    "%.1f,"        // GPS_ALTITUDE  m AMSL
-    "%.4f,"        // GPS_LATITUDE
-    "%.4f,"        // GPS_LONGITUDE
+    "%.1f,"        // GPS_ALTITUDE  m AMSL, res 0.1 m
+    "%.4f,"        // GPS_LATITUDE  deg, res 0.0001
+    "%.4f,"        // GPS_LONGITUDE deg, res 0.0001
     "%u,"          // GPS_SATS
     "%s,"          // CMD_ECHO
-    "%s,"          // SUBSTATE  (mirrors STATE until sub-states are added)
-    "%.1f,"        // MAIN_SOC  % (placeholder)
-    "%.2f,"        // BUS_POWER  W
-    "%u,"          // ACTIVE_MECHS  bitmask
-    "%u,"          // ACTIVE_CAMERA  bitmask
-    "%u\r",        // MATEK  1=heartbeat OK
+    ","            // blank field — required separator before OPTIONAL_DATA
+    "%s,"          // SUBSTATE  (optional)
+    "%.1f,"        // MAIN_SOC  % (optional, placeholder)
+    "%.2f,"        // BUS_POWER  W (optional)
+    "%u,"          // ACTIVE_MECHS  bitmask (optional)
+    "%u,"          // ACTIVE_CAMERA bitmask (optional)
+    "%u\r",        // MATEK heartbeat (optional)
     TEAM_ID_STR,
     mission_time,
     (unsigned long)ctx.packet_count,
@@ -100,8 +103,8 @@ void send_telemetry_packet(MissionContext& ctx) {
     ctx.sd.gps_lon,
     ctx.sd.gps_sats,
     ctx.cmd_echo,
-    telem_state_name(ctx.state),
-    0.0f,                       // MAIN_SOC placeholder
+    telem_state_name(ctx.state),   // SUBSTATE mirrors STATE
+    0.0f,                          // MAIN_SOC placeholder
     ctx.sd.bus_power_w,
     active_mechs,
     camera_active_flags(),
@@ -110,10 +113,10 @@ void send_telemetry_packet(MissionContext& ctx) {
 
   if (ctx.cx_on()) {
     XBEE_SERIAL.print(buf);
+    ctx.packet_count++;   // only count TRANSMITTED packets (guide F1)
   }
 
-  sd_write_line(buf);
-  ctx.packet_count++;
+  sd_write_line(buf);   // SD always logs regardless of CX state
 }
 
 // ============================================================================
@@ -206,8 +209,7 @@ void parse_commands(MissionContext& ctx) {
         char* p = strtok(nullptr, ",");
         if (p && (ctx.flags & FLAG_SIM_ACTIVE)) {
           ctx.sd.sim_pressure_pa = (float)atol(p);
-          // Echo the full command incl. pressure value, e.g. SIMP101325
-          snprintf(ctx.cmd_echo, 32, "SIMP%s", p);
+          snprintf(ctx.cmd_echo, 32, "SIMP%s", p);   // e.g. SIMP101325
         }
       }
 
