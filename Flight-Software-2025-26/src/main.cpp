@@ -66,10 +66,10 @@ void setup() {
   MAVLINK_SERIAL.begin(MAVLINK_BAUD);
   XBEE_SERIAL.begin(XBEE_BAUD);
 
-  while (!sensor_setup()) {
-    Serial.println(F("[SENSOR] Init failed, retrying..."));
-    delay(500);
-  }
+  //while (!sensor_setup()) {
+    //Serial.println(F("[SENSOR] Init failed, retrying..."));
+    //delay(500);
+  //}
 
   payload_release_servo_setup(PIN_SERVO_PAYLOAD);
   egg_release_servo_setup(PIN_SERVO_EGG);
@@ -93,8 +93,15 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
+
+  // ---- PROBE 1: heartbeat ----
+  static uint32_t hb = 0;
+  if (millis() - hb >= 1000) { hb = millis(); Serial.println(F("[HB] loop alive")); }
+
+  
   // 1. GCS commands — always
   parse_commands(ctx);
+  parse_commands(ctx, Serial);
 
   // 2a. MAVLink — drained every loop, in every state.
   poll_mavlink(ctx);
