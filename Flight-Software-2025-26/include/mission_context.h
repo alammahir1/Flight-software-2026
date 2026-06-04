@@ -24,7 +24,7 @@ enum class MissionState : uint8_t {
   FAULT                       = 255
 };
 
-// Internal, detailed state name — used for debug + optional SUBSTATE field.
+// Internal/debug state name (full granularity — used for Serial logs + SD).
 inline const char* state_name(MissionState s) {
   switch (s) {
     case MissionState::LAUNCH_PAD_DISARMED:         return "LAUNCH_PAD_DISARMED";
@@ -42,9 +42,8 @@ inline const char* state_name(MissionState s) {
   }
 }
 
-// Official telemetry STATE string per competition spec. The judges' .csv must
-// contain ONLY these values: LAUNCH_PAD, ASCENT, APOGEE, DESCENT,
-// PROBE_RELEASE, PAYLOAD_RELEASE, LANDED.
+// Competition STATE field — maps internal states to the 7 OFFICIAL strings
+// required by guide §3.1.1.1 #5. THIS is what goes in telemetry.
 inline const char* telem_state_name(MissionState s) {
   switch (s) {
     case MissionState::LAUNCH_PAD_DISARMED:
@@ -57,13 +56,12 @@ inline const char* telem_state_name(MissionState s) {
     case MissionState::DESCENT_PRE_PROBE_RELEASE:
     case MissionState::DESCENT_POST_PROBE_RELEASE:  return "DESCENT";
     case MissionState::GROUNDED:                    return "LANDED";
-    case MissionState::FAULT:                       return "DESCENT"; // anomaly — keep a legal value
     default:                                        return "DESCENT";
   }
 }
 
 // ============================================================================
-//  FSW flags (bit 7-0, MSB to LSB)
+//  FSW flags — persisted in EEPROM / transmitted in telemetry
 // ============================================================================
 #define FLAG_CX_ON            (1u << 7)
 #define FLAG_SIM_ENABLED      (1u << 6)
@@ -78,13 +76,13 @@ struct MissionContext {
   MissionState state    = MissionState::LAUNCH_PAD_DISARMED;
   uint8_t      flags    = 0x00;
 
-  float    ground_alt_m = 0.0f;
-  float    apogee_m     = 0.0f;
-  int      desc_count   = 0;
-  uint32_t packet_count = 0;
-  char     cmd_echo[32] = "-";
+  float    ground_alt_m = 0.0f;  // AMSL altitude of launch pad (set at CAL)
+  float    apogee_m     = 0.0f;  // highest AGL altitude recorded
+  int      desc_count   = 0;     // consecutive samples below apogee
+  uint32_t packet_count = 0;     // TX counter, persisted in EEPROM
+  char     cmd_echo[32] = "-";   // last processed command
 
-  SensorData sd;
+  SensorData sd;                 // all sensor readings
 
   inline bool cx_on()      const { return flags & FLAG_CX_ON; }
   inline bool sim_active() const { return flags & FLAG_SIM_ACTIVE; }
