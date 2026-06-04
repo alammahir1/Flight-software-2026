@@ -56,21 +56,33 @@ struct SensorData {
 
 // ============================================================================
 static Adafruit_INA260 ina260;
+static bool ina260_present = false;   // set by sensor_setup(), checked on read
 
 bool sensor_setup() {
-  if (!ina260.begin()) {
-    Serial.println(F("[SENSOR] INA260 not found on I2C"));
-    return true;
+  ina260_present = ina260.begin();    // true only if the chip ACKs on I2C
+  if (ina260_present) {
+    Serial.println(F("[SENSOR] INA260 OK"));
+  } else {
+    Serial.println(F("[SENSOR] INA260 not found — power telemetry disabled"));
   }
-  Serial.println(F("[SENSOR] INA260 OK"));
-  return true;
+  return true;   // never block boot: a missing INA260 is non-fatal
 }
 
 void read_local_sensors(SensorData& sd) {
-  sd.voltage_v   = ina260.readBusVoltage() / 1000.0f;
-  sd.current_a   = ina260.readCurrent()    / 1000.0f;
-  sd.bus_power_w = ina260.readPower()      / 1000.0f;
+  // --- INA260 (guarded) -----------------------------------------------------
+  // Only touch the I2C bus if the chip was detected at startup. Reading an
+  // uninitialised / absent INA260 dereferences a null I2C device -> hard fault.
+  if (ina260_present) {
+    sd.voltage_v   = ina260.readBusVoltage() / 1000.0f;
+    sd.current_a   = ina260.readCurrent()    / 1000.0f;
+    sd.bus_power_w = ina260.readPower()      / 1000.0f;
+  } else {
+    sd.voltage_v   = 0.0f;
+    sd.current_a   = 0.0f;
+    sd.bus_power_w = 0.0f;
+  }
 
+  // --- LM335AZ external temperature -----------------------------------------
   int   raw    = analogRead(PIN_LM335);
   float volts  = raw * (3.3f / 1023.0f);
   float temp_k = volts / 0.01f;
