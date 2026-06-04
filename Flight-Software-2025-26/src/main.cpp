@@ -9,13 +9,13 @@
  * SD       : Teensy 4.1 SDIO     →  BUILTIN_SDCARD
  *
  * MAVLink consumed: #24 GPS_RAW_INT, #27 RAW_IMU, #29 SCALED_PRESSURE,
- *                   #30 ATTITUDE, #33 GLOBAL_POSITION_INT
+ *                   #33 GLOBAL_POSITION_INT
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <EEPROM.h>
-#include <TimeLib.h>          // Teensy built-in RTC (replaces RV-3028)
+#include <TimeLib.h>
 
 #include "config.h"
 #include "mission_context.h"
@@ -28,20 +28,16 @@
 #include "camera_ctrl.h"
 #include "mavlink_handler.h"
 
-//  Globals — one context object. (RTC is now the Teensy hardware clock.)
 MissionContext ctx;
 
-//  Timing
 uint32_t last_telem_ms  = 0;
 uint32_t last_sensor_ms = 0;
 uint32_t last_eeprom_ms = 0;
 
-//  TimeLib sync provider — reads the Teensy 4.1 hardware RTC.
 time_t getTeensy3Time() {
   return Teensy3Clock.get();
 }
 
-//  Helper: change state, log it, save to EEPROM
 void set_state(MissionState new_state) {
   if (ctx.state == new_state) return;
   ctx.state = new_state;
@@ -58,8 +54,6 @@ void setup() {
 
   Wire.begin();
 
-  // Teensy built-in RTC via TimeLib. Needs a coin cell on VBAT to keep time
-  // across power-off; otherwise time starts at 0 until an ST command.
   setSyncProvider(getTeensy3Time);
   if (timeStatus() == timeSet) {
     Serial.println(F("[RTC] Teensy RTC OK"));
@@ -82,13 +76,14 @@ void setup() {
   camera_setup();
 
   sd_setup();
-  // Header matches the telemetry packet field order (spec fields + optional).
+  // Header must match the packet format exactly, including the blank field
+  // (,,) between CMD_ECHO and optional data (guide §3.1.1.1 #19).
   sd_write_header(
     "TEAM_ID,MISSION_TIME,PACKET_COUNT,MODE,STATE,"
     "ALTITUDE,TEMPERATURE,PRESSURE,VOLTAGE,CURRENT,"
     "GYRO_R,GYRO_P,GYRO_Y,ACCEL_R,ACCEL_P,ACCEL_Y,"
     "GPS_TIME,GPS_ALTITUDE,GPS_LATITUDE,GPS_LONGITUDE,GPS_SATS,"
-    "CMD_ECHO,SUBSTATE,MAIN_SOC,BUS_POWER,ACTIVE_MECHS,ACTIVE_CAMERA,MATEK"
+    "CMD_ECHO,,SUBSTATE,MAIN_SOC,BUS_POWER,ACTIVE_MECHS,ACTIVE_CAMERA,MATEK"
   );
 
   Serial.print(F("[FSW] Ready. State: "));
@@ -101,19 +96,19 @@ void loop() {
   // 1. GCS commands — always
   parse_commands(ctx);
 
-  // 2a. MAVLink — drained every loop, in every state (lockout fix).
+  // 2a. MAVLink — drained every loop, in every state.
   poll_mavlink(ctx);
   update_altitude_from_sim(ctx);   // no-op unless SIM mode active
 
-  // 2b. Local sensors (INA260 + LM335) — 10 Hz, non-blocking schedule.
+  // 2b. Local sensors (INA260 + LM335) — 10 Hz, non-blocking.
   if (now - last_sensor_ms >= SENSOR_POLL_MS) {
     last_sensor_ms = now;
     read_local_sensors(ctx.sd);
 
-    // Landing evaluated ONCE per sample so LANDING_CONFIRM_COUNT is real time.
+    // Landing evaluated ONCE per sample — LANDING_CONFIRM_COUNT = real samples.
     ctx.sd.is_grounded = grounded_detected(ctx);
 
-    // Apogee tracking on the sensor tick (not per loop) with descent margin.
+    // Apogee tracking on the sensor tick with descent margin (not per loop).
     if (ctx.state == MissionState::ASCENT) {
       if (ctx.sd.altitude_m > ctx.apogee_m) {
         ctx.apogee_m   = ctx.sd.altitude_m;
@@ -136,7 +131,7 @@ void loop() {
     last_eeprom_ms = now;
   }
 
-  //  State machine — uses cached ctx.sd.is_grounded (no per-loop counting)
+  // State machine — uses cached ctx.sd.is_grounded (no per-loop counting)
   switch (ctx.state) {
 
     case MissionState::LAUNCH_PAD_DISARMED:
@@ -209,7 +204,6 @@ void loop() {
       break;
 
     default:
-      // Unknown state — hold safe rather than rewinding into ASCENT.
       Serial.println(F("[FSW] CRITICAL: unknown state — entering FAULT"));
       set_state(MissionState::FAULT);
       break;
