@@ -25,6 +25,7 @@ struct SensorData {
   // -- Barometer (SPL06 via F405 MAVLink) --
   float altitude_m    = 0.0f;   // AGL after CAL
   float pressure_kpa  = 0.0f;   // kPa
+  float baro_amsl_m = 0.0f;   // raw barometric AMSL, before ground subtraction
 
   // -- INA260 --
   float voltage_v    = 0.0f;
@@ -107,9 +108,9 @@ void read_local_sensors(SensorData& sd) {
 //  subsequent altitude_m readings are AGL (above ground level).
 // ============================================================================
 void calibrate_ground(SensorData& sd, float& ground_alt_m) {
-  ground_alt_m  = sd.gps_alt_m;
+  ground_alt_m  = sd.baro_amsl_m;   // was sd.gps_alt_m
   sd.altitude_m = 0.0f;
   Serial.print(F("[CAL] Ground alt set to "));
   Serial.print(ground_alt_m, 1);
-  Serial.println(F(" m AMSL"));
+  Serial.println(F(" m AMSL (baro)"));
 }
