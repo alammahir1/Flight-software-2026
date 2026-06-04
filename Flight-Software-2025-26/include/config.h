@@ -47,7 +47,7 @@ const float APOGEE_DESCENT_MARGIN_M  = 1.0f;  // must drop this far below peak b
 const float PAYLOAD_RELEASE_FRAC   = 0.80f;   // 80 % of apogee altitude
 
 // Egg / probe release
-const float EGG_RELEASE_ALT_M      = 10.0f;   // metres AGL
+const float EGG_RELEASE_ALT_M      = 7.0f;   // metres AGL
 
 // Landing detection
 const float LANDING_ALT_M          = 0.5f;    // metres AGL
