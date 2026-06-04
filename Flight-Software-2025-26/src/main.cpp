@@ -110,6 +110,9 @@ void loop() {
     last_sensor_ms = now;
     read_local_sensors(ctx.sd);
 
+    // Landing evaluated ONCE per sample so LANDING_CONFIRM_COUNT is real time.
+    ctx.sd.is_grounded = grounded_detected(ctx);
+
     // Apogee tracking on the sensor tick (not per loop) with descent margin.
     if (ctx.state == MissionState::ASCENT) {
       if (ctx.sd.altitude_m > ctx.apogee_m) {
@@ -133,7 +136,7 @@ void loop() {
     last_eeprom_ms = now;
   }
 
-  //  State machine
+  //  State machine — uses cached ctx.sd.is_grounded (no per-loop counting)
   switch (ctx.state) {
 
     case MissionState::LAUNCH_PAD_DISARMED:
@@ -148,7 +151,6 @@ void loop() {
       break;
 
     case MissionState::ASCENT:
-      if (grounded_detected(ctx)) { set_state(MissionState::GROUNDED); break; }
       if (ctx.desc_count >= APOGEE_CONFIRM_COUNT) {
         set_state(MissionState::APOGEE);
       }
@@ -159,7 +161,7 @@ void loop() {
       break;
 
     case MissionState::DESCENT_PRE_PAYLOAD_RELEASE:
-      if (grounded_detected(ctx)) { set_state(MissionState::GROUNDED); break; }
+      if (ctx.sd.is_grounded) { set_state(MissionState::GROUNDED); break; }
       if ((ctx.apogee_m > 0.0f) &&
           (ctx.sd.altitude_m <= PAYLOAD_RELEASE_FRAC * ctx.apogee_m) &&
           !(ctx.flags & FLAG_PAYLOAD_RELEASED)) {
@@ -178,7 +180,7 @@ void loop() {
       break;
 
     case MissionState::DESCENT_PRE_PROBE_RELEASE:
-      if (grounded_detected(ctx)) { set_state(MissionState::GROUNDED); break; }
+      if (ctx.sd.is_grounded) { set_state(MissionState::GROUNDED); break; }
       if (ctx.sd.altitude_m <= EGG_RELEASE_ALT_M) {
         set_state(MissionState::DESCENT_PROBE_RELEASE);
       }
@@ -195,7 +197,7 @@ void loop() {
       break;
 
     case MissionState::DESCENT_POST_PROBE_RELEASE:
-      if (grounded_detected(ctx)) {
+      if (ctx.sd.is_grounded) {
         set_state(MissionState::GROUNDED);
       }
       break;
@@ -207,9 +209,9 @@ void loop() {
       break;
 
     default:
-      Serial.println(F("[FSW] CRITICAL ERROR: unknown state — reverting to ASCENT"));
-      ctx.desc_count = 0;
-      set_state(MissionState::ASCENT);
+      // Unknown state — hold safe rather than rewinding into ASCENT.
+      Serial.println(F("[FSW] CRITICAL: unknown state — entering FAULT"));
+      set_state(MissionState::FAULT);
       break;
   }
 }
