@@ -2,12 +2,7 @@
  * CanSat 2026 — Team 1079
  * sensing.h  |  Local sensor drivers: INA260 + LM335AZ
  *
- * Sensors on this file:
- *   INA260   — I2C, voltage + current + power
- *   LM335AZ  — Analog pin A0, external temperature
- *
- * Everything else (barometer, IMU, GPS) comes from the F405 via MAVLink
- * and is handled in mavlink_handler.h
+ * Barometer, IMU and GPS arrive from the F405 via MAVLink (mavlink_handler.h).
  */
 
 #pragma once
@@ -17,12 +12,10 @@
 #include "config.h"
 
 // ============================================================================
-//  SensorData struct — all sensor readings in one place.
-//  MAVLink fields are filled by mavlink_handler.h
-//  Local fields are filled by read_local_sensors() below
+//  SensorData struct
 // ============================================================================
 struct SensorData {
-  // -- Barometer (SPL06 via F405 MAVLink SCALED_PRESSURE #29) --
+  // -- Barometer (SPL06 via F405 SCALED_PRESSURE #29) --
   float altitude_m    = 0.0f;   // AGL after CAL
   float baro_amsl_m   = 0.0f;   // raw baro AMSL — used by calibrate_ground()
   float pressure_kpa  = 0.0f;   // kPa
@@ -35,12 +28,12 @@ struct SensorData {
   // -- LM335AZ external temperature --
   float ext_temp_c   = 0.0f;
 
-  // -- ICM-20948 via RAW_IMU MAVLink (#27) — deg/s --
+  // -- ICM-20948 via RAW_IMU (#27) — deg/s --
   float gyro_r = 0.0f;
   float gyro_p = 0.0f;
   float gyro_y = 0.0f;
 
-  // -- ICM-20948 via RAW_IMU MAVLink (#27) — m/s² --
+  // -- ICM-20948 via RAW_IMU (#27) — m/s² --
   float accel_r = 0.0f;
   float accel_p = 0.0f;
   float accel_y = 0.0f;
@@ -50,20 +43,20 @@ struct SensorData {
   uint8_t gps_min   = 0;
   uint8_t gps_sec   = 0;
   float   gps_alt_m = 0.0f;   // AMSL metres (telemetry only)
-  float   gps_lat   = 0.0f;   // decimal degrees
+  float   gps_lat   = 0.0f;
   float   gps_lon   = 0.0f;
   uint8_t gps_sats  = 0;
+
+  // -- Landing result, evaluated once per 10 Hz sensor tick --
+  bool is_grounded = false;
 
   // -- SIM mode pressure override (set by SIMP command) --
   float sim_pressure_pa = 0.0f;
 };
 
 // ============================================================================
-//  INA260 instance (file-scoped)
-// ============================================================================
 static Adafruit_INA260 ina260;
 
-// ============================================================================
 bool sensor_setup() {
   if (!ina260.begin()) {
     Serial.println(F("[SENSOR] INA260 not found on I2C"));
@@ -73,7 +66,6 @@ bool sensor_setup() {
   return true;
 }
 
-// ============================================================================
 void read_local_sensors(SensorData& sd) {
   sd.voltage_v   = ina260.readBusVoltage() / 1000.0f;
   sd.current_a   = ina260.readCurrent()    / 1000.0f;
@@ -86,11 +78,10 @@ void read_local_sensors(SensorData& sd) {
 }
 
 // ============================================================================
-//  calibrate_ground()
-//  Uses baro AMSL (not GPS) so altitude_m zeroes correctly after CAL.
+//  calibrate_ground() — uses baro AMSL (not GPS) so altitude_m zeroes correctly
 // ============================================================================
 void calibrate_ground(SensorData& sd, float& ground_alt_m) {
-  ground_alt_m  = sd.baro_amsl_m;   // baro reference, not GPS
+  ground_alt_m  = sd.baro_amsl_m;
   sd.altitude_m = 0.0f;
   Serial.print(F("[CAL] Ground alt set to "));
   Serial.print(ground_alt_m, 1);
