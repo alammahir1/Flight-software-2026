@@ -3,15 +3,17 @@
  * mavlink_handler.h  |  MAVLink polling and SIM altitude override
  *
  * Consumes MAVLink messages from the Matek F405 on Serial1:
- *   #24  GPS_RAW_INT          satellites_visible, time_usec (UTC)
- *   #27  RAW_IMU              xacc, yacc, zacc (raw counts)
- *   #29  SCALED_PRESSURE      press_abs (hPa), temperature (cdegC) — primary altitude source
- *   #30  ATTITUDE             roll/pitch/yaw (rad → deg)
- *   #33  GLOBAL_POSITION_INT  lat/lon (/1e7 → °), GPS AMSL alt (/1000 → m)
+ *   #24  GPS_RAW_INT        satellites_visible, time_usec (UTC)
+ *   #27  RAW_IMU            accel (mg → m/s²), gyro (mrad/s → deg/s)
+ *   #29  SCALED_PRESSURE    press_abs (hPa) — primary altitude + pressure source
+ *   #33  GLOBAL_POSITION_INT  lat/lon/GPS alt (telemetry only)
  *
- * altitude_m is driven by SCALED_PRESSURE (barometric) via the hypsometric
- * formula. GPS altitude is stored separately for telemetry but is NOT used
- * for flight decisions — GPS altitude is too noisy and slow for apogee/landing.
+ * Unit conversions:
+ *   Gyro:  RAW_IMU xgyro/ygyro/zgyro in mrad/s  → ÷1000 → ×(180/π) = deg/s
+ *   Accel: RAW_IMU xacc/yacc/zacc    in mg       → ÷1000 → ×9.80665 = m/s²
+ *
+ * altitude_m is driven by SCALED_PRESSURE (barometric), NOT GPS.
+ * GPS altitude is stored separately for telemetry only.
  */
 
 #pragma once
@@ -40,9 +42,7 @@ void poll_mavlink(MissionContext& ctx) {
     switch (mav_msg.msgid) {
 
       // MSG #24 — GPS_RAW_INT ------------------------------------------------
-      // Source for satellite count and GPS UTC time.
-      // time_usec is microseconds since UNIX epoch (GPS week rollover-corrected
-      // by ArduPilot). We extract HH:MM:SS of the current UTC day.
+      // Satellite count + GPS UTC time (microseconds since UNIX epoch).
       case MAVLINK_MSG_ID_GPS_RAW_INT: {
         mavlink_gps_raw_int_t gri;
         mavlink_msg_gps_raw_int_decode(&mav_msg, &gri);
@@ -57,43 +57,41 @@ void poll_mavlink(MissionContext& ctx) {
       }
 
       // MSG #27 — RAW_IMU ---------------------------------------------------
+      // Accel: xacc/yacc/zacc in mg (milli-g). Convert → m/s².
+      // Gyro:  xgyro/ygyro/zgyro in mrad/s. Convert → deg/s.
       case MAVLINK_MSG_ID_RAW_IMU: {
         mavlink_raw_imu_t raw;
         mavlink_msg_raw_imu_decode(&mav_msg, &raw);
-        ctx.sd.accel_r = (float)raw.xacc;
-        ctx.sd.accel_p = (float)raw.yacc;
-        ctx.sd.accel_y = (float)raw.zacc;
+
+        const float MG_TO_MS2   = 9.80665f / 1000.0f;   // mg  → m/s²
+        const float MRADS_TO_DEGS = (1.0f / 1000.0f) * (180.0f / PI); // mrad/s → deg/s
+
+        ctx.sd.accel_r = (float)raw.xacc  * MG_TO_MS2;
+        ctx.sd.accel_p = (float)raw.yacc  * MG_TO_MS2;
+        ctx.sd.accel_y = (float)raw.zacc  * MG_TO_MS2;
+
+        ctx.sd.gyro_r  = (float)raw.xgyro * MRADS_TO_DEGS;
+        ctx.sd.gyro_p  = (float)raw.ygyro * MRADS_TO_DEGS;
+        ctx.sd.gyro_y  = (float)raw.zgyro * MRADS_TO_DEGS;
         break;
       }
 
       // MSG #29 — SCALED_PRESSURE -------------------------------------------
-      // Primary altitude source. press_abs is in hPa; convert to Pa for the
-      // hypsometric formula. Temperature is in centidegrees C.
+      // Primary altitude source. press_abs in hPa → Pa for hypsometric formula.
       // In SIM mode this is overridden by update_altitude_from_sim().
       case MAVLINK_MSG_ID_SCALED_PRESSURE: {
         mavlink_scaled_pressure_t sp;
         mavlink_msg_scaled_pressure_decode(&mav_msg, &sp);
-        float pressure_pa   = sp.press_abs * 100.0f;          // hPa → Pa
-        ctx.sd.pressure_kpa = pressure_pa / 1000.0f;          // Pa → kPa for telemetry
-        // Hypsometric formula: altitude AMSL in metres
+        float pressure_pa   = sp.press_abs * 100.0f;         // hPa → Pa
+        ctx.sd.pressure_kpa = pressure_pa / 1000.0f;         // Pa → kPa for telemetry
         float amsl          = 44330.0f * (1.0f - powf(pressure_pa / 101325.0f, 0.1903f));
-        ctx.sd.altitude_m   = amsl - ctx.ground_alt_m;        // AMSL → AGL
-        break;
-      }
-
-      // MSG #30 — ATTITUDE --------------------------------------------------
-      case MAVLINK_MSG_ID_ATTITUDE: {
-        mavlink_attitude_t att;
-        mavlink_msg_attitude_decode(&mav_msg, &att);
-        ctx.sd.gyro_r = att.roll  * (180.0f / PI);
-        ctx.sd.gyro_p = att.pitch * (180.0f / PI);
-        ctx.sd.gyro_y = att.yaw   * (180.0f / PI);
+        ctx.sd.altitude_m   = amsl - ctx.ground_alt_m;       // AMSL → AGL
         break;
       }
 
       // MSG #33 — GLOBAL_POSITION_INT ---------------------------------------
-      // GPS lat/lon/alt stored for telemetry only.
-      // altitude_m (used for flight decisions) comes from SCALED_PRESSURE above.
+      // GPS lat/lon/alt for telemetry fields only.
+      // altitude_m (flight decisions) comes from SCALED_PRESSURE above.
       case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
         mavlink_global_position_int_t gpi;
         mavlink_msg_global_position_int_decode(&mav_msg, &gpi);
@@ -110,15 +108,15 @@ void poll_mavlink(MissionContext& ctx) {
 
 // ============================================================================
 //  SIM mode altitude override
+//  Overwrites barometric altitude_m and pressure_kpa set by SCALED_PRESSURE.
 //  Hypsometric formula: h_amsl = 44330 × (1 − (P/P₀)^0.1903)
-//  Overwrites the barometric altitude_m and pressure_kpa set by SCALED_PRESSURE.
 // ============================================================================
 void update_altitude_from_sim(MissionContext& ctx) {
   if (!ctx.sim_active()) return;
-  float pressure_pa       = ctx.sd.sim_pressure_pa;
-  float amsl              = 44330.0f * (1.0f - powf(pressure_pa / 101325.0f, 0.1903f));
-  ctx.sd.altitude_m       = amsl - ctx.ground_alt_m;
-  ctx.sd.pressure_kpa     = pressure_pa / 1000.0f;
+  float pressure_pa   = ctx.sd.sim_pressure_pa;
+  float amsl          = 44330.0f * (1.0f - powf(pressure_pa / 101325.0f, 0.1903f));
+  ctx.sd.altitude_m   = amsl - ctx.ground_alt_m;
+  ctx.sd.pressure_kpa = pressure_pa / 1000.0f;
 }
 
 // ============================================================================
