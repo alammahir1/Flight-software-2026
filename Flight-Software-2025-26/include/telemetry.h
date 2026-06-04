@@ -111,9 +111,12 @@ void send_telemetry_packet(MissionContext& ctx) {
     matek_heartbeat_ok()
   );
 
+  // Always mirror the packet to USB Serial for debugging
+  Serial.print(buf);
+
   if (ctx.cx_on()) {
     XBEE_SERIAL.print(buf);
-    ctx.packet_count++;   // only count TRANSMITTED packets (guide F1)
+    ctx.packet_count++;   // only count packets actually transmitted over XBee
   }
 
   sd_write_line(buf);   // SD always logs regardless of CX state
@@ -125,10 +128,9 @@ void send_telemetry_packet(MissionContext& ctx) {
 static char rx_buf[128];
 static int  rx_idx = 0;
 
-void parse_commands(MissionContext& ctx) {
-  while (XBEE_SERIAL.available()) {
-    char c = (char)XBEE_SERIAL.read();
-
+void parse_commands(MissionContext& ctx, Stream& port = XBEE_SERIAL) {
+  while (port.available()) {
+    char c = (char)port.read();
     if (c == '\r' || c == '\n') {
       if (rx_idx == 0) continue;
       rx_buf[rx_idx] = '\0';
