@@ -1,33 +1,21 @@
 /*
  * CanSat 2026 — Team 1079 — Manchester Satellite Development Group
- * main.cpp  |  Flight Software
+ * main.cpp  |  Flight Software  (Teensy 4.1 built-in RTC)
  *
  * MCU      : Teensy 4.1
- * Co-proc  : Matek F405-miniTE  →  Serial1 (RX=1, TX=1) @ 115200 baud, MAVLink
- * RTC      : RV3028              →  I2C (Wire)
- * Radio    : XBee 3 Pro          →  Serial6 (RX=6, TX=6) @ 9600 baud
+ * Co-proc  : Matek F405-miniTE  →  Serial1 @ 115200, MAVLink
+ * RTC      : Teensy 4.1 built-in (TimeLib / Teensy3Clock; VBAT coin cell)
+ * Radio    : XBee 3 Pro          →  Serial6 @ 9600
  * SD       : Teensy 4.1 SDIO     →  BUILTIN_SDCARD
  *
- * MAVLink messages consumed:
- *   #24  GPS_RAW_INT          satellites_visible, UTC time
- *   #27  RAW_IMU              xacc, yacc, zacc (raw counts)
- *   #29  SCALED_PRESSURE      press_abs (hPa) — primary altitude source
- *   #30  ATTITUDE             roll/pitch/yaw (rad → deg)
- *   #33  GLOBAL_POSITION_INT  lat/lon/alt (telemetry only)
- *
- * Telemetry packet (1 Hz CSV, '\r' terminated):
- *   TEAM_ID, MISSION_TIME, PACKET_COUNT, MODE, STATE,
- *   ALTITUDE, TEMPERATURE, PRESSURE, VOLTAGE, CURRENT,
- *   GYRO_R, GYRO_P, GYRO_Y, ACCEL_R, ACCEL_P, ACCEL_Y,
- *   GPS_TIME, GPS_ALTITUDE, GPS_LATITUDE, GPS_LONGITUDE, GPS_SATS,
- *   CMD_ECHO, SUBSTATE, MAIN_SOC, BUS_POWER, ACTIVE_MECHS,
- *   ACTIVE_CAMERA, MATEK
+ * MAVLink consumed: #24 GPS_RAW_INT, #27 RAW_IMU, #29 SCALED_PRESSURE,
+ *                   #30 ATTITUDE, #33 GLOBAL_POSITION_INT
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <EEPROM.h>
-#include <RV-3028-C7.h>
+#include <TimeLib.h>          // Teensy built-in RTC (replaces RV-3028)
 
 #include "config.h"
 #include "mission_context.h"
@@ -40,14 +28,18 @@
 #include "camera_ctrl.h"
 #include "mavlink_handler.h"
 
-//  Globals — one context object and the RTC. That's it.
+//  Globals — one context object. (RTC is now the Teensy hardware clock.)
 MissionContext ctx;
-RV3028         rtc;
 
 //  Timing
 uint32_t last_telem_ms  = 0;
 uint32_t last_sensor_ms = 0;
 uint32_t last_eeprom_ms = 0;
+
+//  TimeLib sync provider — reads the Teensy 4.1 hardware RTC.
+time_t getTeensy3Time() {
+  return Teensy3Clock.get();
+}
 
 //  Helper: change state, log it, save to EEPROM
 void set_state(MissionState new_state) {
@@ -58,13 +50,6 @@ void set_state(MissionState new_state) {
   Serial.println(state_name(new_state));
 }
 
-// NOTE: is_pre_launch() has been removed. It was only ever used to gate
-// sensor polling, which was the lockout bug. Now that poll_mavlink() runs
-// unconditionally every loop, there is nothing left that needs to test for
-// pre-launch as a combined condition — the state machine handles each state
-// individually. Keeping a dead helper that was the root cause of a critical
-// bug would be confusing.
-
 
 void setup() {
   Serial.begin(115200);
@@ -73,11 +58,13 @@ void setup() {
 
   Wire.begin();
 
-  if (!rtc.begin()) {
-    Serial.println(F("[RTC] RV3028 not found — awaiting ST command"));
+  // Teensy built-in RTC via TimeLib. Needs a coin cell on VBAT to keep time
+  // across power-off; otherwise time starts at 0 until an ST command.
+  setSyncProvider(getTeensy3Time);
+  if (timeStatus() == timeSet) {
+    Serial.println(F("[RTC] Teensy RTC OK"));
   } else {
-    rtc.set24Hour();
-    Serial.println(F("[RTC] RV3028 OK"));
+    Serial.println(F("[RTC] Teensy RTC not set — awaiting ST command"));
   }
 
   eeprom_restore(ctx);
@@ -95,6 +82,7 @@ void setup() {
   camera_setup();
 
   sd_setup();
+  // Header matches the telemetry packet field order (spec fields + optional).
   sd_write_header(
     "TEAM_ID,MISSION_TIME,PACKET_COUNT,MODE,STATE,"
     "ALTITUDE,TEMPERATURE,PRESSURE,VOLTAGE,CURRENT,"
@@ -111,35 +99,23 @@ void loop() {
   uint32_t now = millis();
 
   // 1. GCS commands — always
-  parse_commands(ctx, rtc);
+  parse_commands(ctx);
 
-  // 2a. MAVLink — drained every loop, in every state.
-  //     This is the only source of accel_y / altitude_m. It is a non-blocking
-  //     UART drain and must never be gated by state — doing so was the lockout
-  //     bug that prevented launch detection on the pad.
+  // 2a. MAVLink — drained every loop, in every state (lockout fix).
   poll_mavlink(ctx);
   update_altitude_from_sim(ctx);   // no-op unless SIM mode active
 
-  // 2b. Local sensors: INA260 (I2C) + LM335 (analog) — 10 Hz timer.
-  //     These are blocking calls (~500 µs each on I2C). Scheduling them at
-  //     SENSOR_POLL_MS keeps the loop fast for launch detection while still
-  //     updating power/temperature data fast enough for 1 Hz telemetry.
+  // 2b. Local sensors (INA260 + LM335) — 10 Hz, non-blocking schedule.
   if (now - last_sensor_ms >= SENSOR_POLL_MS) {
     last_sensor_ms = now;
     read_local_sensors(ctx.sd);
 
-    // Apogee tracking is evaluated here — on the sensor tick — NOT every loop
-    // iteration. Evaluating it every loop caused desc_count to blow past
-    // APOGEE_CONFIRM_COUNT in milliseconds on a single GPS wobble, triggering
-    // false apogee detection. Tying it to the sensor tick means desc_count
-    // increments at most 10 times per second, matching actual sensor cadence.
+    // Apogee tracking on the sensor tick (not per loop) with descent margin.
     if (ctx.state == MissionState::ASCENT) {
       if (ctx.sd.altitude_m > ctx.apogee_m) {
         ctx.apogee_m   = ctx.sd.altitude_m;
         ctx.desc_count = 0;
       } else if (ctx.sd.altitude_m < ctx.apogee_m - APOGEE_DESCENT_MARGIN_M) {
-        // Only count descent once we've dropped at least APOGEE_DESCENT_MARGIN_M
-        // below the peak — filters GPS/baro jitter at apogee.
         ctx.desc_count++;
       }
     }
@@ -147,7 +123,7 @@ void loop() {
 
   // 3. Telemetry — 1 Hz
   if (now - last_telem_ms >= TELEM_INTERVAL_MS) {
-    send_telemetry_packet(ctx, rtc);
+    send_telemetry_packet(ctx);
     last_telem_ms = now;
   }
 
@@ -161,7 +137,6 @@ void loop() {
   switch (ctx.state) {
 
     case MissionState::LAUNCH_PAD_DISARMED:
-      // Waiting for CMD,1079,MEC,ARM,ON from GCS — handled in parse_commands()
       break;
 
     case MissionState::LAUNCH_PAD_ARMED:
@@ -173,11 +148,7 @@ void loop() {
       break;
 
     case MissionState::ASCENT:
-      // Apogee tracking runs in the sensor tick above.
-      if (grounded_detected(ctx)) {
-        set_state(MissionState::GROUNDED);
-        break;
-      }
+      if (grounded_detected(ctx)) { set_state(MissionState::GROUNDED); break; }
       if (ctx.desc_count >= APOGEE_CONFIRM_COUNT) {
         set_state(MissionState::APOGEE);
       }
