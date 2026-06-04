@@ -1,11 +1,11 @@
 /*
  * CanSat 2026 — Team 1079
- * eeprom_store.cpp  |  EEPROM layout and read/write
+ * eeprom_store.h  |  EEPROM layout and read/write
  *
  * Layout (Teensy 4.1, 4284 bytes emulated EEPROM):
  *   Addr  0      magic byte  0xCA
  *   Addr  1      MissionState (uint8_t)
- *   Addr  2-5    apogee_m    (float)
+ *   Addr  2-5    apogee_m     (float)
  *   Addr  6-9    ground_alt_m (float)
  *   Addr 10-13   packet_count (uint32_t)
  *   Addr 14      flags — SIM bits only
@@ -23,7 +23,6 @@
 #define ADDR_PKTC   10
 #define ADDR_FLAGS  14
 
-// Flag bits in ADDR_FLAGS
 void eeprom_save(const MissionContext& ctx) {
   EEPROM.update(ADDR_MAGIC, MAGIC_VAL);
   EEPROM.update(ADDR_STATE, (uint8_t)ctx.state);
@@ -40,9 +39,12 @@ void eeprom_restore(MissionContext& ctx) {
   }
 
   uint8_t raw = EEPROM.read(ADDR_STATE);
+  // FIX: corrupt/unknown state falls back to LAUNCH_PAD_DISARMED, not ASCENT.
+  // ASCENT on a cold boot would immediately start apogee tracking with no real
+  // altitude data, potentially triggering payload release at ground level.
   ctx.state = (raw <= (uint8_t)MissionState::GROUNDED)
                 ? (MissionState)raw
-                : MissionState::ASCENT;   // safe fallback
+                : MissionState::LAUNCH_PAD_DISARMED;
 
   EEPROM.get(ADDR_APOG, ctx.apogee_m);
   EEPROM.get(ADDR_GNDA, ctx.ground_alt_m);
