@@ -22,10 +22,10 @@
 //  Local fields are filled by read_local_sensors() below
 // ============================================================================
 struct SensorData {
-  // -- Barometer (SPL06 via F405 MAVLink) --
+  // -- Barometer (SPL06 via F405 MAVLink SCALED_PRESSURE #29) --
   float altitude_m    = 0.0f;   // AGL after CAL
+  float baro_amsl_m   = 0.0f;   // raw baro AMSL — used by calibrate_ground()
   float pressure_kpa  = 0.0f;   // kPa
-  float baro_amsl_m = 0.0f;   // raw barometric AMSL, before ground subtraction
 
   // -- INA260 --
   float voltage_v    = 0.0f;
@@ -35,21 +35,21 @@ struct SensorData {
   // -- LM335AZ external temperature --
   float ext_temp_c   = 0.0f;
 
-  // -- ICM-20948 via ATTITUDE MAVLink (#30) — degrees/s --
+  // -- ICM-20948 via RAW_IMU MAVLink (#27) — deg/s --
   float gyro_r = 0.0f;
   float gyro_p = 0.0f;
   float gyro_y = 0.0f;
 
-  // -- ICM-20948 via RAW_IMU MAVLink (#27) — raw counts --
+  // -- ICM-20948 via RAW_IMU MAVLink (#27) — m/s² --
   float accel_r = 0.0f;
   float accel_p = 0.0f;
   float accel_y = 0.0f;
 
-  // -- GPS via GLOBAL_POSITION_INT MAVLink (#33) --
+  // -- GPS via GPS_RAW_INT (#24) + GLOBAL_POSITION_INT (#33) --
   uint8_t gps_hour  = 0;
   uint8_t gps_min   = 0;
   uint8_t gps_sec   = 0;
-  float   gps_alt_m = 0.0f;   // AMSL metres
+  float   gps_alt_m = 0.0f;   // AMSL metres (telemetry only)
   float   gps_lat   = 0.0f;   // decimal degrees
   float   gps_lon   = 0.0f;
   uint8_t gps_sats  = 0;
@@ -64,37 +64,21 @@ struct SensorData {
 static Adafruit_INA260 ina260;
 
 // ============================================================================
-//  sensor_setup()
-//  Called once in setup(). Returns false if a sensor doesn't respond so
-//  main.cpp can retry.
-// ============================================================================
 bool sensor_setup() {
   if (!ina260.begin()) {
     Serial.println(F("[SENSOR] INA260 not found on I2C"));
     return false;
   }
   Serial.println(F("[SENSOR] INA260 OK"));
-  // LM335AZ is passive analogue — no init needed
   return true;
 }
 
 // ============================================================================
-//  read_local_sensors()
-//  Called every loop iteration when not in PRE_LAUNCH or GROUNDED.
-// ============================================================================
 void read_local_sensors(SensorData& sd) {
-  // --- INA260 ---------------------------------------------------------------
-  // Library returns mV and mA so divide by 1000 to get V and A
   sd.voltage_v   = ina260.readBusVoltage() / 1000.0f;
   sd.current_a   = ina260.readCurrent()    / 1000.0f;
   sd.bus_power_w = ina260.readPower()      / 1000.0f;
 
-  // --- LM335AZ --------------------------------------------------------------
-  // LM335 outputs 10mV per Kelvin
-  // Teensy 4.1 ADC: 10-bit (0-1023) at 3.3V reference
-  // So: voltage = raw * (3.3 / 1023)
-  //     temp_K  = voltage / 0.01
-  //     temp_C  = temp_K - 273.15
   int   raw    = analogRead(PIN_LM335);
   float volts  = raw * (3.3f / 1023.0f);
   float temp_k = volts / 0.01f;
@@ -103,12 +87,10 @@ void read_local_sensors(SensorData& sd) {
 
 // ============================================================================
 //  calibrate_ground()
-//  Called when CAL command received on launch pad.
-//  Latches current GPS AMSL altitude as the ground reference so all
-//  subsequent altitude_m readings are AGL (above ground level).
+//  Uses baro AMSL (not GPS) so altitude_m zeroes correctly after CAL.
 // ============================================================================
 void calibrate_ground(SensorData& sd, float& ground_alt_m) {
-  ground_alt_m  = sd.baro_amsl_m;   // was sd.gps_alt_m
+  ground_alt_m  = sd.baro_amsl_m;   // baro reference, not GPS
   sd.altitude_m = 0.0f;
   Serial.print(F("[CAL] Ground alt set to "));
   Serial.print(ground_alt_m, 1);
