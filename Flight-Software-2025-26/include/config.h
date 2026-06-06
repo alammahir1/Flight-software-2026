@@ -63,5 +63,5 @@ const uint32_t EEPROM_SAVE_MS      = 5000;    // periodic EEPROM flush
 const uint32_t SENSOR_POLL_MS      = 100;     // 10 Hz INA260 non-blocking
 
 // Camera trigger pins (digital HIGH = record, LOW = stop)
-const int PIN_CAM_RELEASE = 20;
-const int PIN_CAM_GROUND  = 21;
+const int PIN_CAM_RELEASE = 5;
+const int PIN_CAM_GROUND  = 4;
